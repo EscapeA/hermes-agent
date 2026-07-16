@@ -807,6 +807,16 @@ def build_turn_context(
     # event time. Preserve either value and cover any legacy unstamped handoff.
     stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
 
+    # If the bridge already pre-persisted this user message to the session DB
+    # (_last_flushed_db_idx was advanced past len(messages)), stamp the marker
+    # so _flush_messages_to_session_db skips it — prevents double-write (#42039).
+    # Preserve any marker already stamped by an earlier close flush / CLI handoff.
+    if (
+        not user_msg.get("_db_persisted")
+        and getattr(agent, "_last_flushed_db_idx", 0) > len(messages)
+    ):
+        user_msg["_db_persisted"] = True
+
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():
         agent._hydrate_todo_store(conversation_history)
