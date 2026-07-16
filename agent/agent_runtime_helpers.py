@@ -932,8 +932,21 @@ def try_recover_primary_transport(
     """Rebuild the primary client once and retry after ``max_retries`` exhaust on a transient
     transport error. Skipped for aggregators (OpenRouter, Nous) that manage retries server-side."""
     error_type = type(api_error).__name__
-    if agent._fallback_activated or error_type not in _TRANSIENT_TRANSPORT_ERRORS or agent._is_openrouter_url():
+    if agent._fallback_activated or agent._is_openrouter_url():
         return False
+    # Only for transient transport errors. Walk the exception chain so
+    # openai.APIConnectionError wrapping httpx.ConnectError / BrokenPipe
+    # still triggers pool rebuild (#52216).
+    error_types = set()
+    cur = api_error
+    seen = 0
+    while cur is not None and seen < 6:
+        error_types.add(type(cur).__name__)
+        cur = cur.__cause__ or cur.__context__
+        seen += 1
+    if not (error_types & _TRANSIENT_TRANSPORT_ERRORS):
+        return False
+    error_type = type(api_error).__name__
     # Portal OpenAI-wire traffic rides aggregator retry infra (skip), but Portal Claude on native
     # Messages holds a local Anthropic client that needs the rebuild.
     if (
@@ -967,7 +980,7 @@ def try_recover_primary_transport(
         wait_time = min(3 + retry_count, 8)
         agent._vprint(
             f"{agent.log_prefix}🔁 Transient {error_type} on {agent.provider} — "
-            f"rebuilt client, waiting {wait_time}s before one last primary attempt.", force=True,
+            f"rebuilt client (fresh TCP), waiting {wait_time}s before one last primary attempt.", force=True,
         )
         time.sleep(wait_time)
         return True
@@ -1197,6 +1210,15 @@ def restore_primary_runtime(agent) -> bool:
 # Transient transport failures worth one more attempt with a rebuilt client / connection pool.
 _TRANSIENT_TRANSPORT_ERRORS = frozenset({
     "ReadTimeout", "ConnectTimeout", "PoolTimeout", "ConnectError", "RemoteProtocolError",
+    # Keep aligned with agent.error_classifier._TRANSPORT_ERROR_TYPES so the
+    # recovery gate does not skip errors the classifier already treats as
+    # transport (#52216).
+    "ConnectionError", "ConnectionResetError",
+    "ConnectionAbortedError", "BrokenPipeError",
+    "TimeoutError", "ReadError",
+    "ServerDisconnectedError",
+    "SSLError", "SSLZeroReturnError", "SSLWantReadError",
+    "SSLWantWriteError", "SSLEOFError", "SSLSyscallError",
     "APIConnectionError", "APITimeoutError",
 })
 _INLINE_REASONING_PATTERNS = tuple(
