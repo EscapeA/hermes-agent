@@ -597,6 +597,11 @@ def build_turn_context(
                 )
         except Exception:
             pass
+    # A successful previous recovery may have forced fresh-TCP clients; once
+    # the next turn starts, allow normal keepalive again unless cleanup just
+    # rebuilt the pool (cleanup path already rebuilt with current preference).
+    if getattr(agent, "_prefer_fresh_tcp", False):
+        agent._prefer_fresh_tcp = False
     # Replay compression warning through status_callback for gateway platforms.
     if agent._compression_warning:
         agent._replay_compression_warning()

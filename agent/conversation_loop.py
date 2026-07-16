@@ -4183,6 +4183,10 @@ def run_conversation(
                         prompt_tokens, completion_tokens, total_tokens,
                         api_duration, _cache_pct,
                     )
+                    # Transport recovery may force fresh TCP for retries; clear
+                    # once a call actually succeeds so later turns can keep-alive.
+                    if getattr(agent, "_prefer_fresh_tcp", False):
+                        agent._prefer_fresh_tcp = False
 
                     # On the MoA path, agent.model/provider are the virtual
                     # preset name ("closed") and "moa", which have no pricing
