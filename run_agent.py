@@ -5104,7 +5104,12 @@ class AIAgent:
         return False
 
     @staticmethod
-    def _build_keepalive_http_client(base_url: str = "", *, verify: Any = True) -> Any:
+    def _build_keepalive_http_client(
+        base_url: str = "",
+        *,
+        verify: Any = True,
+        prefer_fresh: bool = False,
+    ) -> Any:
         """Build an httpx.Client with proactive idle-connection reaping.
 
         Previously this method injected a custom ``httpx.HTTPTransport``
@@ -5136,13 +5141,29 @@ class AIAgent:
             # HTTP_PROXY / HTTPS_PROXY / NO_PROXY correctly.
             _proxy = _get_proxy_for_base_url(base_url)
 
-            # Proactive pool reaping: close idle connections at 20 s,
-            # before reverse proxies (30–60 s typical) send FIN and
-            # cause CLOSE-WAIT accumulation.
+            # Prefer no keep-alive after a transport recovery, or when the
+            # caller opts in via prefer_fresh=True. Avoids reusing sockets
+            # that remote NATs/firewalls already closed (common for direct
+            # custom HTTP providers; shows up as APIConnectionError with no
+            # upstream application logs).
+            prefer_fresh = bool(prefer_fresh)
+            base = (base_url or "").strip().lower()
+            is_plain_http = base.startswith("http://")
+            if prefer_fresh:
+                max_keepalive, keepalive_expiry = 0, 0.0
+            elif is_plain_http:
+                # Direct HTTP endpoints (e.g. self-hosted OpenAI-compat
+                # gateways) often sit behind short idle NAT timeouts.
+                max_keepalive, keepalive_expiry = 5, 2.0
+            else:
+                max_keepalive, keepalive_expiry = 20, 20.0
+
+            # Proactive pool reaping: close idle connections before reverse
+            # proxies (30–60 s typical) send FIN and cause CLOSE-WAIT.
             _limits = _httpx.Limits(
-                max_keepalive_connections=20,
+                max_keepalive_connections=max_keepalive,
                 max_connections=100,
-                keepalive_expiry=20.0,
+                keepalive_expiry=keepalive_expiry,
             )
 
             # Timeouts: generous read=None for SSE streaming endpoints.
@@ -5156,12 +5177,14 @@ class AIAgent:
             # When _proxy is None (NO_PROXY bypass or no proxy configured),
             # mount plain transports to prevent httpx from reading env proxy
             # vars and creating an HTTPProxy mount that would bypass our
-            # NO_PROXY resolution.
+            # NO_PROXY resolution. Pass the same Limits so keepalive tuning
+            # applies to the mounted transports (httpx does not inherit
+            # client-level limits onto explicit mounts).
             _mounts = {}
             if _proxy is None:
                 _mounts = {
-                    "http://": _httpx.HTTPTransport(verify=verify),
-                    "https://": _httpx.HTTPTransport(verify=verify),
+                    "http://": _httpx.HTTPTransport(verify=verify, limits=_limits),
+                    "https://": _httpx.HTTPTransport(verify=verify, limits=_limits),
                 }
             return _httpx.Client(
                 limits=_limits,

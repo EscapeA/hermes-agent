@@ -1302,10 +1302,19 @@ def try_recover_primary_transport(
     if agent._fallback_activated:
         return False
 
-    # Only for transient transport errors
-    error_type = type(api_error).__name__
-    if error_type not in _TRANSIENT_TRANSPORT_ERRORS:
+    # Only for transient transport errors. Walk the exception chain so
+    # openai.APIConnectionError wrapping httpx.ConnectError / BrokenPipe
+    # still triggers pool rebuild (#52216).
+    error_types = set()
+    cur = api_error
+    seen = 0
+    while cur is not None and seen < 6:
+        error_types.add(type(cur).__name__)
+        cur = cur.__cause__ or cur.__context__
+        seen += 1
+    if not (error_types & _TRANSIENT_TRANSPORT_ERRORS):
         return False
+    error_type = type(api_error).__name__
 
     # Skip for aggregator providers — they manage their own retry infra
     if agent._is_openrouter_url():
@@ -1323,6 +1332,11 @@ def try_recover_primary_transport(
         return False
 
     try:
+        # Prefer brand-new TCP for the recovery attempt and subsequent
+        # request-scoped stream clients. Stale keep-alive reuse is a common
+        # source of "Connection error" with empty upstream logs.
+        agent._prefer_fresh_tcp = True
+
         # Retire the existing client to release stale connections. #70773:
         # never hard-close the shared client here — this runs on the
         # conversation-loop thread while workers from stale-killed streaming
@@ -1337,6 +1351,7 @@ def try_recover_primary_transport(
                 )
             except Exception:
                 pass
+        agent.client = None
 
         # Rebuild from primary snapshot
         rt = agent._primary_runtime
@@ -1379,7 +1394,7 @@ def try_recover_primary_transport(
         wait_time = min(3 + retry_count, 8)
         agent._vprint(
             f"{agent.log_prefix}🔁 Transient {error_type} on {agent.provider} — "
-            f"rebuilt client, waiting {wait_time}s before one last primary attempt.",
+            f"rebuilt client (fresh TCP), waiting {wait_time}s before one last primary attempt.",
             force=True,
         )
         time.sleep(wait_time)
@@ -1774,9 +1789,18 @@ def restore_primary_runtime(agent) -> bool:
 
 # Which error types indicate a transient transport failure worth
 # one more attempt with a rebuilt client / connection pool.
+# Keep aligned with agent.error_classifier._TRANSPORT_ERROR_TYPES so the
+# recovery gate does not skip errors the classifier already treats as
+# transport (#52216).
 _TRANSIENT_TRANSPORT_ERRORS = frozenset({
     "ReadTimeout", "ConnectTimeout", "PoolTimeout",
     "ConnectError", "RemoteProtocolError",
+    "ConnectionError", "ConnectionResetError",
+    "ConnectionAbortedError", "BrokenPipeError",
+    "TimeoutError", "ReadError",
+    "ServerDisconnectedError",
+    "SSLError", "SSLZeroReturnError", "SSLWantReadError",
+    "SSLWantWriteError", "SSLEOFError", "SSLSyscallError",
     "APIConnectionError", "APITimeoutError",
 })
 
@@ -2506,8 +2530,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
                 if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
             }
             if "http_client" not in safe_kwargs:
+                prefer_fresh = bool(getattr(agent, "_prefer_fresh_tcp", False))
                 keepalive_http = agent._build_keepalive_http_client(
-                    base_url, verify=httpx_verify,
+                    base_url, verify=httpx_verify, prefer_fresh=prefer_fresh,
                 )
                 if keepalive_http is not None:
                     safe_kwargs["http_client"] = keepalive_http
@@ -2537,8 +2562,11 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # Tests in ``tests/run_agent/test_create_openai_client_reuse.py`` and
     # ``tests/run_agent/test_sequential_chats_live.py`` pin this invariant.
     if "http_client" not in client_kwargs:
+        prefer_fresh = bool(getattr(agent, "_prefer_fresh_tcp", False))
         keepalive_http = agent._build_keepalive_http_client(
-            client_kwargs.get("base_url", ""), verify=httpx_verify,
+            client_kwargs.get("base_url", ""),
+            verify=httpx_verify,
+            prefer_fresh=prefer_fresh,
         )
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http

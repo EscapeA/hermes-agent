@@ -404,6 +404,70 @@ class TestTryRecoverPrimaryTransport:
 
 
 
+    def test_recovers_on_pool_timeout(self):
+        agent = _make_agent(provider="zai")
+        error = _make_transport_error("PoolTimeout")
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()), \
+             patch("time.sleep"):
+            result = agent._try_recover_primary_transport(
+                error, retry_count=3, max_retries=3,
+            )
+
+        assert result is True
+
+    def test_recovers_on_openai_api_connection_error(self):
+        agent = _make_agent(provider="custom")
+        error = _make_transport_error("APIConnectionError")
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()), \
+             patch("time.sleep"):
+            result = agent._try_recover_primary_transport(
+                error, retry_count=3, max_retries=3,
+            )
+
+        assert result is True
+        assert getattr(agent, "_prefer_fresh_tcp", False) is True
+
+    def test_recovers_on_broken_pipe_error(self):
+        """#52216: BrokenPipeError must trigger connection-pool rebuild."""
+        agent = _make_agent(provider="custom")
+        error = _make_transport_error("BrokenPipeError")
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()), \
+             patch("time.sleep"):
+            result = agent._try_recover_primary_transport(
+                error, retry_count=3, max_retries=3,
+            )
+
+        assert result is True
+        assert getattr(agent, "_prefer_fresh_tcp", False) is True
+
+    def test_recovers_when_transport_error_is_wrapped(self):
+        """openai.APIConnectionError often wraps httpx.ConnectError."""
+        agent = _make_agent(provider="custom")
+        outer = _make_transport_error("APIConnectionError")
+        outer.__cause__ = _make_transport_error("ConnectError")
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()), \
+             patch("time.sleep"):
+            result = agent._try_recover_primary_transport(
+                outer, retry_count=3, max_retries=3,
+            )
+
+        assert result is True
+
+    def test_recovers_on_openai_api_timeout_error(self):
+        agent = _make_agent(provider="custom")
+        error = _make_transport_error("APITimeoutError")
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()), \
+             patch("time.sleep"):
+            result = agent._try_recover_primary_transport(
+                error, retry_count=3, max_retries=3,
+            )
+
+        assert result is True
 
     def test_skipped_when_already_on_fallback(self):
         agent = _make_agent(provider="custom")
@@ -477,6 +541,27 @@ class TestTryRecoverPrimaryTransport:
             # wait_time = min(3 + 10, 8) = 8
             mock_sleep.assert_called_once_with(8)
 
+    def test_retires_existing_client_before_rebuild(self):
+        """#70773: the old shared client is retired (sockets shutdown, FD
+        release deferred to GC), never hard-closed — this path runs on the
+        conversation-loop thread while stale-killed workers may still be
+        unwinding on the old pool."""
+        agent = _make_agent(provider="custom")
+        old_client = agent.client
+        error = _make_transport_error("ReadTimeout")
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()), \
+             patch("time.sleep"), \
+             patch.object(agent, "_close_openai_client") as mock_close, \
+             patch.object(agent, "_retire_shared_openai_client") as mock_retire:
+            agent._try_recover_primary_transport(
+                error, retry_count=3, max_retries=3,
+            )
+            mock_retire.assert_called_once_with(
+                old_client, reason="primary_recovery",
+            )
+            mock_close.assert_not_called()
+            assert getattr(agent, "_prefer_fresh_tcp", False) is True
 
     def test_survives_rebuild_failure(self):
         """If client rebuild fails, returns False gracefully."""
@@ -490,6 +575,51 @@ class TestTryRecoverPrimaryTransport:
             )
 
         assert result is False
+
+
+class TestBuildKeepaliveHttpClientFreshTcp:
+    @staticmethod
+    def _pool_limits(client):
+        # Prefer the transport that will actually handle the URL when mounts
+        # are present; fall back to the default transport.
+        transport = client._transport
+        mounts = getattr(client, "_mounts", None) or {}
+        if mounts:
+            transport = next(iter(mounts.values()))
+        pool = transport._pool
+        return pool._max_keepalive_connections, pool._keepalive_expiry
+
+    def test_prefer_fresh_disables_keepalive(self):
+        from run_agent import AIAgent
+
+        client = AIAgent._build_keepalive_http_client(
+            "http://119.8.32.187:6677/v1", prefer_fresh=True,
+        )
+        assert client is not None
+        max_ka, expiry = self._pool_limits(client)
+        assert max_ka == 0
+        assert expiry == 0.0
+        client.close()
+
+    def test_plain_http_uses_short_keepalive(self):
+        from run_agent import AIAgent
+
+        client = AIAgent._build_keepalive_http_client("http://127.0.0.1:6677/v1")
+        assert client is not None
+        max_ka, expiry = self._pool_limits(client)
+        assert max_ka == 5
+        assert expiry == 2.0
+        client.close()
+
+    def test_https_keeps_default_keepalive(self):
+        from run_agent import AIAgent
+
+        client = AIAgent._build_keepalive_http_client("https://api.example.com/v1")
+        assert client is not None
+        max_ka, expiry = self._pool_limits(client)
+        assert max_ka == 20
+        assert expiry == 20.0
+        client.close()
 
 
 # =============================================================================
